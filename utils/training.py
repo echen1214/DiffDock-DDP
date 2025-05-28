@@ -123,18 +123,18 @@ def loss_function_ddp(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_si
 def loss_function(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma, device, tr_weight=1, rot_weight=1,
                   tor_weight=1, backbone_weight=0, sidechain_weight=0, apply_mean=True, no_torsion=False):
     tr_sigma, rot_sigma, tor_sigma = t_to_sigma(
-        *[torch.cat([d.complex_t[noise_type] for d in data]) if device.type == 'cuda' else data.complex_t[noise_type]
+        *[torch.cat([d.complex_t[noise_type] for d in data]) if device.type == 'cuda' and isinstance(data, list) else data.complex_t[noise_type]
           for noise_type in ['tr', 'rot', 'tor']])
     mean_dims = (0, 1) if apply_mean else 1
 
     # translation component
-    tr_score = torch.cat([d.tr_score for d in data], dim=0) if device.type == 'cuda' else data.tr_score
+    tr_score = torch.cat([d.tr_score for d in data], dim=0) if device.type == 'cuda' and isinstance(data, list) else data.tr_score
     tr_sigma = tr_sigma.unsqueeze(-1)
     tr_loss = ((tr_pred.cpu() - tr_score.cpu()) ** 2 * tr_sigma.cpu() ** 2).mean(dim=mean_dims)
     tr_base_loss = (tr_score ** 2 * tr_sigma ** 2).mean(dim=mean_dims).detach()
 
     # rotation component
-    rot_score = torch.cat([d.rot_score for d in data], dim=0) if device.type == 'cuda' else data.rot_score
+    rot_score = torch.cat([d.rot_score for d in data], dim=0) if device.type == 'cuda' and isinstance(data, list) else data.rot_score
     rot_score_norm = so3.score_norm(rot_sigma.cpu()).unsqueeze(-1)
     rot_loss = (((rot_pred.cpu() - rot_score.cpu()) / rot_score_norm) ** 2).mean(dim=mean_dims)
     rot_base_loss = ((rot_score.cpu() / rot_score_norm) ** 2).mean(dim=mean_dims).detach()
@@ -142,8 +142,8 @@ def loss_function(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma,
     # torsion component
     if not no_torsion:
         edge_tor_sigma = torch.from_numpy(
-            np.concatenate([d.tor_sigma_edge for d in data] if device.type == 'cuda' else data.tor_sigma_edge))
-        tor_score = torch.cat([d.tor_score for d in data], dim=0) if device.type == 'cuda' else data.tor_score
+            np.concatenate([d.tor_sigma_edge for d in data] if device.type == 'cuda' and isinstance(data, list) else data.tor_sigma_edge))
+        tor_score = torch.cat([d.tor_score for d in data], dim=0) if device.type == 'cuda' and isinstance(data, list) else data.tor_score
         tor_score_norm2 = torch.tensor(torus.score_norm(edge_tor_sigma.cpu().numpy())).float()
         tor_loss = ((tor_pred.cpu() - tor_score.cpu()) ** 2 / tor_score_norm2)
         tor_base_loss = ((tor_score.cpu() ** 2 / tor_score_norm2)).detach()
@@ -151,14 +151,14 @@ def loss_function(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma,
             tor_loss, tor_base_loss = tor_loss.mean() * torch.ones(1, dtype=torch.float), tor_base_loss.mean() * torch.ones(1, dtype=torch.float)
         else:
             index = torch.cat([torch.ones(d['ligand'].edge_mask.sum()) * i for i, d in
-                               enumerate(data)]).long() if device.type == 'cuda' else data['ligand'].batch[
+                               enumerate(data)]).long() if device.type == 'cuda' and isinstance(data, list) else data['ligand'].batch[
                 data['ligand', 'ligand'].edge_index[0][data['ligand'].edge_mask]]
-            num_graphs = len(data) if device.type == 'cuda' else data.num_graphs
+            num_graphs = len(data) if device.type == 'cuda' and isinstance(data, list) else data.num_graphs
             t_l, t_b_l, c = torch.zeros(num_graphs), torch.zeros(num_graphs), torch.zeros(num_graphs)
-            c.index_add_(0, index, torch.ones(tor_loss.shape))
+            c.index_add_(0, index.cpu(), torch.ones(tor_loss.shape))
             c = c + 0.0001
-            t_l.index_add_(0, index, tor_loss)
-            t_b_l.index_add_(0, index, tor_base_loss)
+            t_l.index_add_(0, index.cpu(), tor_loss)
+            t_b_l.index_add_(0, index.cpu(), tor_base_loss)
             tor_loss, tor_base_loss = t_l / c, t_b_l / c
     else:
         if apply_mean:

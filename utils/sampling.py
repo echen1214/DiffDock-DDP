@@ -137,6 +137,7 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                     tr_perturb = (0.5 * tr_g ** 2 * dt_tr * tr_score)
                     rot_perturb = (0.5 * rot_score * dt_rot * rot_g ** 2)
                 else:
+                    # perturb is the modified Euler-Maruyama reverse SDE update
                     tr_z = torch.zeros((min(batch_size, N), 3), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
                         else torch.normal(mean=0, std=1, size=(min(batch_size, N), 3), device=device)
                     tr_perturb = (tr_g ** 2 * dt_tr * tr_score + tr_g * np.sqrt(dt_tr) * tr_z)
