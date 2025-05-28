@@ -27,12 +27,15 @@ from rdkit.Chem import RemoveAllHs
 from utils.download import download_and_extract
 from datasets.lazy_pdbbind import LazyPDBBindSet
 from datasets.loader import CombineLazyPDBBindSet
+from datasets.pdbbind import NoiseTransform
 from torch.utils.data import DataLoader
 from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl, get_t_schedule
 from utils.sampling import randomize_position, sampling
 from utils.utils import get_model, ExponentialMovingAverage, read_strings_from_txt
 from utils.visualise import PDBFile
+from utils.training import loss_function
 from tqdm import tqdm
+
 
 RDLogger.DisableLog('rdApp.*')
 import yaml
@@ -43,7 +46,8 @@ REMOTE_URLS = [f"{REPOSITORY_URL}/releases/latest/download/diffdock_models.zip",
                f"{REPOSITORY_URL}/releases/download/v1.1/diffdock_models.zip"]
 
 def get_dataset(args, model_args, confidence=False):
-    dataset = LazyPDBBindSet(transform=None, root=args.data_dir, limit_complexes=args.limit_complexes, dataset=args.dataset,
+    dataset = LazyPDBBindSet(transform=model_args.transform if "transform" in model_args else None, 
+                    root=args.data_dir, limit_complexes=args.limit_complexes, dataset=args.dataset,
                     chain_cutoff=args.chain_cutoff,
                     receptor_radius=model_args.receptor_radius,
                     cache_path=model_args.cache_path, split_path=args.split_path,
@@ -68,7 +72,59 @@ def get_dataset(args, model_args, confidence=False):
                     num_conformers=args.samples_per_complex if args.resample_rdkit and not confidence else 1)
     return dataset
 
+def eval_epoch(model, data, device, t_to_sigma, loss_fn):
+    # optimizer, loader, ema_weights
+    model.eval()
+    try:
+        if isinstance(data, list):
+            ## is data is passed in as list -> then the model is a DataParallel model
+            if device.type == 'cuda' and len(data) == 1 or device.type == 'cpu' and data.num_graphs == 1:
+                print("Skipping batch of size 1 since otherwise batchnorm would not work.")
+                return
+            data = [d.to(device) for d in data] if device.type == 'cuda' else data
+        else:
+            ## else it is a regular model/DistributedDataParallel model
+            data = data.to(device)
+        with torch.no_grad():
+            tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
+        loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)
+        if loss_tuple is None or torch.any(torch.isnan(loss_tuple[0])):
+            has_error = True
+            loss_tuple[0].zero_()
+            num_nan += 1
+            print('Nan detected evaluating complexes ' + str(data.name) + ' (batch idx ' + str(data_idx) + ')')
+        # else:
+        #     meter.add([loss_tuple[0].cpu().detach(), *loss_tuple[1:]])
+        return(loss_tuple)
+    except RuntimeError as e:
+        if 'out of memory' in str(e):
+            print('| WARNING: ran out of memory, skipping batch')
+            for p in model.parameters():
+                if p.grad is not None:
+                    del p.grad  # free some memory
+            torch.cuda.empty_cache()
+            # continue
+        elif 'Input mismatch' in str(e):
+            print('| WARNING: weird torch_cluster error, skipping batch')
+            for p in model.parameters():
+                if p.grad is not None:
+                    del p.grad  # free some memory
+            torch.cuda.empty_cache()
+            # continue
+        else:
+            print(e)
+            raise e
+        return
+            # continue    
 
+def torch_device_constructor(loader, node):
+    # Check if the node is a sequence (list/tuple)
+    if isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node)
+        return torch.device(*value)  # Unpack the sequence
+    else:
+        value = loader.construct_scalar(node)
+        return torch.device(value)
 
 if __name__ == '__main__':
     cache_name = datetime.now().strftime('date%d-%m_time%H-%M-%S.%f')
@@ -113,7 +169,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int, default=1, help='Number of workers for dataset creation')
     parser.add_argument('--tqdm', action='store_true', default=False, help='Whether to show progress bar')
     parser.add_argument('--save_visualisation', action='store_true', default=True, help='Whether to save visualizations')
-    parser.add_argument('--samples_per_complex', type=int, default=4, help='Number of poses to sample for each complex')
+    parser.add_argument('--dont_save_visualisation', action='store_true', default=False, help='Whether to save visualizations')
+    parser.add_argument('--samples_per_complex', type=int, default=10, help='Number of poses to sample for each complex')
     parser.add_argument('--resample_rdkit', action='store_true', default=False, help='')
     parser.add_argument('--skip_matching', action='store_true', default=False, help='')
     parser.add_argument('--sigma_schedule', type=str, default='expbeta', help='Schedule type, no other options')
@@ -158,17 +215,22 @@ if __name__ == '__main__':
     parser.add_argument('--gnina_poses_to_optimize', type=int, default=1)
 
     parser.add_argument('--crop_beyond', type=float, default=None, help='')
+    parser.add_argument('--get_epoch0_loss', action='store_true', default=False, help='')
 
     args = parser.parse_args()
     if args.config:
         config_dict = yaml.load(args.config, Loader=yaml.FullLoader)
         arg_dict = args.__dict__
         for key, value in config_dict.items():
-            if isinstance(value, list):
-                for v in value:
-                    arg_dict[key].append(v)
-            else:
-                arg_dict[key] = value
+            if key not in arg_dict.keys():
+                if isinstance(value, list):
+                    for v in value:
+                        arg_dict[key].append(v)
+                else:
+                    arg_dict[key] = value
+
+    if args.dont_save_visualisation:
+        args.save_visualisation=False
 
     if args.restrict_cpu:
         threads = 16
@@ -206,6 +268,9 @@ if __name__ == '__main__':
 
     if args.out_dir is None: args.out_dir = f'inference_out_dir_not_specified/{args.run_name}'
     os.makedirs(args.out_dir, exist_ok=True)
+    # Register the custom constructor
+    yaml.add_constructor('tag:yaml.org,2002:python/object/apply:torch.device', torch_device_constructor)
+
     with open(f'{args.model_dir}/model_parameters.yml') as f:
         score_model_args = Namespace(**yaml.full_load(f))
         if not hasattr(score_model_args, 'separate_noise_schedule'):  # exists for compatibility with old runs that did not have the attribute
@@ -228,10 +293,11 @@ if __name__ == '__main__':
             score_model_args.esm_embeddings_path = None
         if args.force_fixed_center_conv:
             score_model_args.not_fixed_center_conv = False
-        if not hasattr(score_model_args, 'DDP'):
-            score_model_args.DDP = False
+        # if not hasattr(score_model_args, 'DDP'):
+        #     score_model_args.DDP = False
         if hasattr(args, 'cache_path'):
             score_model_args.cache_path = args.cache_path
+        score_model_args.DDP = False
     if args.confidence_model_dir is not None:
         with open(f'{args.confidence_model_dir}/model_parameters.yml') as f:
             confidence_args = Namespace(**yaml.full_load(f))
@@ -254,6 +320,20 @@ if __name__ == '__main__':
         torch.set_num_threads(args.num_cpu)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    t_to_sigma = partial(t_to_sigma_compl, args=score_model_args)
+    # print("t_to_sigma", t_to_sigma)
+
+    if args.get_epoch0_loss:
+        # optimizer, scheduler = get_optimizer_and_scheduler(args, model, scheduler_mode=args.inference_earlystop_goal if args.val_inference_freq is not None else 'min')
+        loss_fn = partial(loss_function, tr_weight=0.33, rot_weight=0.33,
+                tor_weight=0.33, no_torsion=False, backbone_weight=0,
+                sidechain_weight=0)
+        transform = NoiseTransform(t_to_sigma=t_to_sigma, no_torsion=score_model_args.no_torsion,
+                            all_atom=score_model_args.all_atoms, alpha=score_model_args.sampling_alpha, beta=score_model_args.sampling_beta,
+                            include_miscellaneous_atoms=False if not hasattr(score_model_args, 'include_miscellaneous_atoms') else score_model_args.include_miscellaneous_atoms,
+                            crop_beyond_cutoff=score_model_args.crop_beyond)
+        # score_model_args.transform = transform
+
     print(f"DiffDock will run on {device}")
     test_dataset = get_dataset(args, score_model_args)
     if args.confidence_model_dir is not None:
@@ -262,8 +342,6 @@ if __name__ == '__main__':
             print('HAPPENING | confidence model uses different type of graphs than the score model. Loading (or creating if not existing) the data for the confidence model now.')
             confidence_test_dataset = get_dataset(args, confidence_args, confidence=True)
 #            confidence_complex_dict = {d.name: d for d in confidence_test_dataset}
-
-    t_to_sigma = partial(t_to_sigma_compl, args=score_model_args)
 
     if not args.no_model:
         model = get_model(score_model_args, device, t_to_sigma=t_to_sigma, no_parallel=True, old=args.old_score_model)
@@ -276,7 +354,7 @@ if __name__ == '__main__':
         if args.ckpt == 'last_model.pt':
             model_state_dict = state_dict['model']
             ema_weights_state = state_dict['ema_weights']
-            model.load_state_dict(model_state_dict, strict=True)
+            model.load_state_dict(model_state_dict, strict=False)
             ema_weights = ExponentialMovingAverage(model.parameters(), decay=score_model_args.ema_rate)
             ema_weights.load_state_dict(ema_weights_state, device=device)
             ema_weights.copy_to(model.parameters())
@@ -284,6 +362,11 @@ if __name__ == '__main__':
             model.load_state_dict(state_dict, strict=True)
             model = model.to(device)
             model.eval()
+
+        if 'epoch' in state_dict:
+            print(f"Loaded {args.ckpt} from epoch {state_dict['epoch']}")
+        else:
+            print("Epoch information not found in the state_dict.")
         if args.confidence_model_dir is not None:
             if confidence_args.transfer_weights:
                 with open(f'{confidence_args.original_model_dir}/model_parameters.yml') as f:
@@ -373,6 +456,38 @@ if __name__ == '__main__':
     failures = 0
     skipped = 0
 
+    def get_rmsd_bin(value):
+        if 0 <= value < 1:
+            return "0-1"
+        elif 1 <= value < 2:
+            return "1-2"
+        elif 2 <= value < 3:
+            return "2-3"
+        elif 3 <= value < 5:
+            return "3-5"
+        elif 5 <= value < 10:
+            return "5-10"
+        else:
+            return "10+"
+
+    comp_minrmsd_loss_table = {comp: {
+        "0-1": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "1-2": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "2-3": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "3-5": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "5-10": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "10+": {i: [] for i in np.arange(0, 1.05, 0.05)},
+    } for comp in ["tr", "tor", "rot"]}
+
+    comp_medrmsd_loss_table = {comp: {
+        "0-1": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "1-2": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "2-3": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "3-5": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "5-10": {i: [] for i in np.arange(0, 1.05, 0.05)},
+        "10+": {i: [] for i in np.arange(0, 1.05, 0.05)},
+    } for comp in ["tr", "tor", "rot"]}
+
     combined_datasets = CombineLazyPDBBindSet(test_dataset, confidence_test_dataset)
     loader = DataLoader(combined_datasets, batch_size=1, num_workers=1, collate_fn=lambda batch: [x for x in batch if x is not None])
 
@@ -442,6 +557,7 @@ if __name__ == '__main__':
                                                      temp_psi=[args.temp_psi_tr, args.temp_psi_rot, args.temp_psi_tor],
                                                      temp_sigma_data=[args.temp_sigma_data_tr, args.temp_sigma_data_rot, args.temp_sigma_data_tor])
 
+                      
                 run_times.append(time.time() - start_time)
                 if score_model_args.no_torsion:
                     orig_complex_graph['ligand'].orig_pos = (orig_complex_graph['ligand'].pos.cpu().numpy() + orig_complex_graph.original_center.cpu().numpy())
@@ -554,6 +670,31 @@ if __name__ == '__main__':
                 names_list.append(orig_complex_graph.name[0])
                 rmsds_list.append(rmsd)
                 success = 1
+
+                if args.get_epoch0_loss:
+                # do i pass in orig_complex_graph or _orig_complex_graph?
+                # something about how the model gets loaded makes this inconsistent
+                # orig_complex_graph : doesn;t work because complex_t isn't accessible
+                # _orig_complex_graph : generates complex_t -> but there is no ['receptor'].batch
+                # from torch_geometric.data import Batch
+                # orig_complex_graph = Batch.from_data_list([orig_complex_graph]) : calls _t , provides batch, but leads to NotImplementedError
+                # orig_complex_graph = Batch.from_data_list([_orig_complex_graph]) : same here
+                    for _ in range(0,100):
+                        x = copy.deepcopy(_orig_complex_graph)
+                        x1 = transform(x)
+                        x2 = next(iter(GeometricDataLoader([x1], batch_size=len(x1))))
+                        loss_tup = eval_epoch(model, x2, device, t_to_sigma, loss_fn)
+                        # print(x1.complex_t, loss_tup)
+                        bin_min = get_rmsd_bin(np.min(rmsd))
+                        bin_med = get_rmsd_bin(np.median(rmsd))
+
+                        for c1 ,comp in enumerate(["tr", "rot", "tor"]):
+                            # print(np.min(rmsd), (x1.complex_t[comp] // 0.05) * 0.05, loss_tup[1+c1])
+                            comp_minrmsd_loss_table[comp][bin_min][(x1.complex_t[comp].detach().item() // 0.05) * 0.05].append(loss_tup[1+c1].item())
+                            comp_medrmsd_loss_table[comp][bin_med][(x1.complex_t[comp].detach().item() // 0.05) * 0.05].append(loss_tup[1+c1].item())
+                        
+                    # loss_tup = eval_epoch(model, orig_complex_graph, device, t_to_sigma, loss_fn)
+  
             except Exception as e:
                 print("Failed on", orig_complex_graph["name"], e, flush = True)
                 print(traceback.format_exc(), flush = True)
@@ -578,6 +719,12 @@ if __name__ == '__main__':
     print('Performance without hydrogens included in the loss')
     print(failures, "failures due to exceptions")
     print(skipped, ' skipped because complex was not in confidence dataset')
+
+    if args.get_epoch0_loss:
+        with open(os.path.join(args.out_dir, "minrmsd_epoch0_loss.pkl"), 'wb') as f:
+            pickle.dump(comp_minrmsd_loss_table, f)        
+        with open(os.path.join(args.out_dir, "medrmsd_epoch0_loss.pkl"), 'wb') as f:
+            pickle.dump(comp_medrmsd_loss_table, f) 
 
     if args.save_complexes:
         print("Saving complexes.")
