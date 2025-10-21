@@ -95,6 +95,8 @@ class LazyPDBBindSet(Dataset):
             self.cache = mmap.mmap(self.cache_file.fileno(), 0, flags=mmap.MAP_PRIVATE, prot=mmap.PROT_READ)
             self.complex_names_all = [x for x in self.complex_names_all if x in self.cache_idx]
             print(f"number of complexes: {len(self.complex_names_all)}")
+        else:
+            print("No cache")
 
     def __del__(self):
         if self.cache:
@@ -150,7 +152,7 @@ class LazyPDBBindSet(Dataset):
                 for row in smile_file.readlines():
                     parsed_row = row.split('\t')
                     self.ligand_smiles[(parsed_row[0].upper(), parsed_row[1].upper())] = parsed_row[2].strip()
-
+        print("Preprocessing")
         print(self.split_path)
         self.complex_names_all = read_strings_from_txt(self.split_path)
         if self.slurm_array_task_count:
@@ -169,8 +171,10 @@ class LazyPDBBindSet(Dataset):
             chain_indices_dictlist = defaultdict(list)
             for embedding in glob.glob(os.path.join(self.esm_embeddings_path, '*_chain_*.pt')):
                 parsed_embedding = embedding.split('/')[-1].split('.')[0].split('_chain_')
+                parsed_embedding = embedding.split('/')[-1].split('_chain_')
                 key_name = parsed_embedding[0]
                 if key_name not in self.complex_names_all:
+                    
                     continue
                 chain_idx = parsed_embedding[1]
                 chain_embeddings_dictlist[key_name].append(embedding)
@@ -283,6 +287,7 @@ def read_mol(pdbbind_dir, complex_name, pdb_name, suffix='ligand', remove_hs=Fal
         lig = read_molecule(os.path.join(pdbbind_dir, complex_name, f'{pdb_name}_{suffix}.sdf'), remove_hs=remove_hs, sanitize=True)
     except:
         lig = None
+        print(f"now trying to read {os.path.join(pdbbind_dir, complex_name, f'{pdb_name}_{suffix}')}  .mol2/.pdb")
     if lig is None:  # read mol2 file if sdf file cannot be sanitized
         try:
             lig = read_molecule(os.path.join(pdbbind_dir, complex_name, f'{pdb_name}_{suffix}.mol2'), remove_hs=remove_hs, sanitize=True)

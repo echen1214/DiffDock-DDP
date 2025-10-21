@@ -176,6 +176,22 @@ def safe_index(l, e):
     except:
         return len(l) - 1
 
+def load_receptor_wrapper(path):
+    if path.endswith('.cif'):
+        pdb = pr.parseMMCIF(path)
+    else:
+        pdb = pr.parsePDB(path)
+    return pdb
+
+def extract_align_receptor(path_to_reference, path, complex_graph, neighbor_cutoff=20, max_neighbors=None, sequences_to_embeddings=None,
+                        knn_only_graph=False, lm_embeddings=None, all_atoms=False, atom_cutoff=None, atom_max_neighbors=None ):
+    ref_pdb = load_receptor_wrapper(path_to_reference)
+    pdb = load_receptor_wrapper(path)
+
+    seq = pdb.ca.getSequence()
+    coords = get_coords(pdb)
+    one_hot = get_onehot_sequence(seq)
+
 
 def moad_extract_receptor_structure(path, complex_graph, neighbor_cutoff=20, max_neighbors=None, sequences_to_embeddings=None,
                                     knn_only_graph=False, lm_embeddings=None, all_atoms=False, atom_cutoff=None, atom_max_neighbors=None):
