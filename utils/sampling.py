@@ -11,7 +11,6 @@ from utils.torsion import modify_conformer_torsion_angles
 from scipy.spatial.transform import Rotation as R
 from utils.utils import crop_beyond
 from utils.logging_utils import get_logger
-from utils.geometry import rigid_transform_Kabsch_3D_torch
 
 
 def randomize_position(data_list, no_torsion, no_random, tr_sigma_max, pocket_knowledge=False, pocket_cutoff=7,
@@ -70,7 +69,7 @@ def is_iterable(arr):
 def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_schedule, device, t_to_sigma, model_args,
              no_random=False, ode=False, visualization_list=None, confidence_model=None, confidence_data_list=None, confidence_model_args=None,
              t_schedule=None, batch_size=32, no_final_step_noise=False, pivot=None, return_full_trajectory=False,
-             temp_sampling=1.0, temp_psi=0.0, temp_sigma_data=0.5, return_features=False, no_kabsch=False):
+             temp_sampling=1.0, temp_psi=0.0, temp_sigma_data=0.5, return_features=False):
     N = len(data_list)
     trajectory = []
     logger = get_logger()
@@ -103,7 +102,6 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                 tr_sigma, rot_sigma, tor_sigma = t_to_sigma(t_tr, t_rot, t_tor)
 
                 if hasattr(model_args, 'crop_beyond') and model_args.crop_beyond is not None:
-                    #print('Cropping beyond', tr_sigma * 3 + model_args.crop_beyond, 'for score model')
                     mod_complex_graph_batch = copy.deepcopy(complex_graph_batch).to_data_list()
                     for batch in mod_complex_graph_batch:
                         crop_beyond(batch, tr_sigma * 3 + model_args.crop_beyond, model_args.all_atoms)
@@ -189,7 +187,7 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                 # Apply noise
                 complex_graph_batch['ligand'].pos = \
                     modify_conformer_batch(complex_graph_batch['ligand'].pos, complex_graph_batch, tr_perturb, rot_perturb,
-                                           tor_perturb if not model_args.no_torsion else None, mask_rotate, no_kabsch)
+                                           tor_perturb if not model_args.no_torsion else None, mask_rotate)
 
                 if visualization_list is not None:
                     for idx_b in range(b):

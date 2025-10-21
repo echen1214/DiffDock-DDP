@@ -5,39 +5,21 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 import torch
 import traceback
-import math
 
 from confidence.dataset import ListDataset
 from utils import so3, torus
 from utils.molecules_utils import get_symmetry_rmsd
 from utils.sampling import randomize_position, sampling
 from utils.diffusion_utils import get_t_schedule
-from torch.nn.functional import linear, sigmoid, leaky_relu
 
 
 def loss_function_ddp(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma, device, tr_weight=1, rot_weight=1,
-                  tor_weight=1, backbone_weight=0, sidechain_weight=0, apply_mean=True, no_torsion=False, weighted_tor=False):
+                  tor_weight=1, backbone_weight=0, sidechain_weight=0, apply_mean=True, no_torsion=False):
     ## the original DiffDock uses DataParallel and DataListLoader to pass in data in the form of a list
     ## thus this code is written in the anticipation that the data will be a list
     ## this loss_function should be rewritten to handle a HeteroDataBatch from DataLoader
     tr_sigma, rot_sigma, tor_sigma = t_to_sigma(*[data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']])
     mean_dims = (0, 1) if apply_mean else 1
-
-    if weighted_tor and weighted_tor != 5:
-        tor_weight_factor = 1.0
-        rot_weight_factor = 1.0
-        if weighted_tor == 1 or weighted_tor == 6:
-            # Average ligand size is 30 heavy atoms. sqrt(30) ~= 5.5
-            tor_weight_factor = math.sqrt(float(data['ligand'].pos.shape[0])) / 5.5
-            rot_weight_factor = tor_weight_factor
-        elif weighted_tor == 2:
-            tor_weight_factor = float(data['ligand'].pos.shape[0]) / 30.0
-            rot_weight_factor = tor_weight_factor
-        elif weighted_tor == 3:
-            # 5.03 is the average number of rotatable bonds
-            tor_weight_factor = float(data['ligand'].torsion_weights.shape[0]) / 5.03
-        rot_weight *= rot_weight_factor
-        tor_weight *= tor_weight_factor
 
     # translation component
     tr_score = data.tr_score # torch.cat([d.tr_score for d in data], dim=0) if device.type == 'cuda' else data.tr_score
@@ -57,22 +39,8 @@ def loss_function_ddp(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_si
         tor_score = data.tor_score
         tor_score_norm2 = torch.tensor(torus.score_norm(edge_tor_sigma.cpu().numpy())).float()
         tor_loss = ((tor_pred.cpu() - tor_score.cpu()) ** 2 / tor_score_norm2)
-        if weighted_tor and weighted_tor != 5 and weighted_tor != 7:
-            if weighted_tor != 6:
-                torsion_weights = data['ligand'].heuristic_torsion_weights.cpu()
-            else:
-                torsion_weights = data['ligand'].lin_torsion_weights.cpu()
-            tor_loss *= torsion_weights
-        elif weighted_tor == 7:
-            in_vec = (tor_pred - tor_score)**2
-            weight1 = data['ligand'].nn_torsion_model[0]
-            bias1 = data['ligand'].nn_torsion_model[1]
-            weight2 = data['ligand'].nn_torsion_model[2]
-            bias2 = data['ligand'].nn_torsion_model[3]
-            tor_loss = sigmoid(linear(leaky_relu(linear(in_vec, weight1, bias1), negative_slope=0.1), weight2, bias2)).cpu() * 2
-
         tor_base_loss = ((tor_score.cpu() ** 2 / tor_score_norm2)).detach()
-        if apply_mean or weighted_tor == 7:
+        if apply_mean:
             tor_loss, tor_base_loss = tor_loss.mean() * torch.ones(1, dtype=torch.float), tor_base_loss.mean() * torch.ones(1, dtype=torch.float)
         else:
             index =  data['ligand'].batch[data['ligand', 'ligand'].edge_index[0][data['ligand'].edge_mask]]
@@ -148,8 +116,6 @@ def loss_function_ddp(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_si
             sidechain_loss, sidechain_base_loss = torch.zeros(len(rot_loss), dtype=torch.float), torch.zeros(
                 len(rot_loss), dtype=torch.float)
 
-    if weighted_tor == 5:
-        tor_loss = torch.where(tor_loss > 1.0, 1.0, tor_loss)
     loss = tr_loss * tr_weight + rot_loss * rot_weight + tor_loss * tor_weight + sidechain_loss * sidechain_weight + backbone_loss * backbone_weight
     return loss, tr_loss.detach(), rot_loss.detach(), tor_loss.detach(), backbone_loss.detach(), sidechain_loss.detach(), \
            tr_base_loss, rot_base_loss, tor_base_loss, backbone_base_loss, sidechain_base_loss
@@ -287,7 +253,7 @@ class AverageMeter():
 
     def summary(self):
         if self.intervals == 1:
-            out = {k: v.item() / self.count if self.count else 2.0 for k, v in self.acc.items()}
+            out = {k: v.item() / self.count for k, v in self.acc.items()}
             return out
         else:
             out = {}
@@ -298,7 +264,7 @@ class AverageMeter():
             return out
 
 
-def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, weighted_tor=False):
+def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights):
     model.train()
     meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'])
@@ -328,7 +294,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 
         try:
             tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
-            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, device=device, weighted_tor=weighted_tor)
+            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, device=device)
             loss = loss_tuple[0]
 
             if torch.any(torch.isnan(loss)):
@@ -378,7 +344,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     return out
 
 
-def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False, weighted_tor=False):
+def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
     model.eval()
     meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss',
@@ -409,7 +375,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 data = data.to(device)
             with torch.no_grad():
                 tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
-            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device, weighted_tor=weighted_tor)
+            loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)
             if loss_tuple is None or torch.any(torch.isnan(loss_tuple[0])):
                 has_error = True
                 loss_tuple[0].zero_()

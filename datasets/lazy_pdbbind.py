@@ -38,11 +38,9 @@ class LazyPDBBindSet(Dataset):
                  slurm_array_idx=None,
                  slurm_array_task_count=None,
                  max_receptor_size=None,
-                 knn_only_graph=False, matching_tries=1, dataset='AlloSet',
-                 skip_tor_model=False):
+                 knn_only_graph=False, matching_tries=1, dataset='AlloSet'):
 
         super(LazyPDBBindSet, self).__init__(root, transform)
-        self.skip_tor_model = skip_tor_model
         self.smile_file = smile_file
         self.ligand_smiles = {}
         self.slurm_array_idx = slurm_array_idx
@@ -194,7 +192,7 @@ class LazyPDBBindSet(Dataset):
 
     def get_complex(self, name, lm_embedding_chains):
         if not os.path.exists(os.path.join(self.pdbbind_dir, name)):
-            print("Folder not found", name)
+            print("Folder not found ", os.path.join(self.pdbbind_dir, name))
             return None, None,
 
         try:
@@ -238,7 +236,7 @@ class LazyPDBBindSet(Dataset):
             complex_graph = HeteroData()
             complex_graph['name'] = name
             get_lig_graph_with_matching(lig, complex_graph, self.popsize, self.maxiter, self.matching, self.keep_original,
-                                        self.num_conformers, remove_hs=self.remove_hs, tries=self.matching_tries, skip_tor_model=self.skip_tor_model)
+                                        self.num_conformers, remove_hs=self.remove_hs, tries=self.matching_tries)
 
             moad_extract_receptor_structure(path=os.path.join(self.pdbbind_dir, name, f'{pdb}_{self.protein_file}.pdb'),
                                             complex_graph=complex_graph,
@@ -251,6 +249,8 @@ class LazyPDBBindSet(Dataset):
                                             atom_max_neighbors=self.atom_max_neighbors)
             if orig_lig_pos is not None:
                 complex_graph['ligand'].orig_pos = orig_lig_pos
+                rot, tr = rigid_transform_Kabsch_3D_torch(complex_graph['ligand'].pos.T, torch.tensor(complex_graph['ligand'].orig_pos, dtype=torch.float32).T)
+                complex_graph['ligand'].pos = complex_graph['ligand'].pos @ rot.T + tr.T
 
         except Exception as e:
             print(f'Skipping {name} because of the error:')
@@ -262,12 +262,7 @@ class LazyPDBBindSet(Dataset):
             print(f"Skipping {name} because receptor was too large (" + str(complex_graph['receptor'].pos.shape[0]) + ' residues)')
             return None, None
         protein_center = torch.mean(complex_graph['receptor'].pos, dim=0, keepdim=True)
-        #lig_center = torch.mean(complex_graph['ligand'].pos, dim=0, keepdim=True)
         lig_center = torch.mean(torch.from_numpy(complex_graph['ligand'].orig_pos), dim=0, keepdim=True)
-        #if torch.sum((protein_center - lig_center)**2) > 1000.0:
-            # This usually means our simulation dissociated
-            #print('Skipping ' + complex_graph['name'] + ' due to dissociation', flush=True)
-            #return None, None
         complex_graph['receptor'].pos -= protein_center
         if self.all_atoms:
             complex_graph['atom'].pos -= protein_center

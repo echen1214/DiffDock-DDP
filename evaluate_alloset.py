@@ -46,7 +46,7 @@ def get_dataset(args, model_args, confidence=False):
     dataset = LazyPDBBindSet(transform=None, root=args.data_dir, limit_complexes=args.limit_complexes, dataset=args.dataset,
                     chain_cutoff=args.chain_cutoff,
                     receptor_radius=model_args.receptor_radius,
-                    cache_path=model_args.cache_path, split_path=args.split_path,
+                    cache_path=args.cache_path, split_path=args.split_path,
                     remove_hs=model_args.remove_hs, max_lig_size=None,
                     c_alpha_max_neighbors=model_args.c_alpha_max_neighbors,
                     matching=not model_args.no_torsion, keep_original=True,
@@ -61,7 +61,6 @@ def get_dataset(args, model_args, confidence=False):
                     protein_file=args.protein_file,
                     ligand_file=args.ligand_file,
                     smile_file=args.smile_file,
-                    skip_tor_model=True,
                     slurm_array_idx=args.slurm_array_idx,
                     slurm_array_task_count=args.slurm_array_task_count,
                     knn_only_graph=True if not hasattr(args, 'not_knn_only_graph') else not args.not_knn_only_graph,
@@ -69,6 +68,13 @@ def get_dataset(args, model_args, confidence=False):
                     num_conformers=args.samples_per_complex if args.resample_rdkit and not confidence else 1)
     return dataset
 
+# Sometimes the model saving code will erroneously append "module" to all the state variable names.
+def state_dict_fixup(old_state_dict):
+    fixed_state_dict = {}
+    for key in old_state_dict.keys():
+        new_key = key.replace('module.', '')
+        fixed_state_dict[new_key] = old_state_dict[key]
+    return fixed_state_dict
 
 
 if __name__ == '__main__':
@@ -99,7 +105,7 @@ if __name__ == '__main__':
     parser.add_argument('--complexes_save_path', type=str, default=None, help='')
 
     parser.add_argument('--dataset', type=str, default='moad', help='')
-    parser.add_argument('--cache_path', type=str, default='data/cache', help='Folder from where to load/restore cached dataset')
+    parser.add_argument('--cache_path', type=str, default='eval_cache', help='Folder from where to load/restore cached dataset')
     parser.add_argument('--data_dir', type=str, default='../../ligbind/data/BindingMOAD_2020_ab_processed_biounit/', help='Folder containing original structures')
     parser.add_argument('--split_path', type=str, default='data/BindingMOAD_2020_ab_processed/splits/val.txt', help='Path of file defining the split')
     parser.add_argument('--confidence_cache_path', type=str, default='data/cache', help='Folder from where to load/restore cached dataset')
@@ -159,6 +165,8 @@ if __name__ == '__main__':
     parser.add_argument('--gnina_poses_to_optimize', type=int, default=1)
 
     parser.add_argument('--crop_beyond', type=float, default=None, help='')
+    parser.add_argument('--num_dataloader_workers', type=int, default=1)
+    parser.add_argument('--dataloader_prefetch_factor', type=int, default=1)
 
     args = parser.parse_args()
 
@@ -274,46 +282,18 @@ if __name__ == '__main__':
 
     if not args.no_model:
         model = get_model(score_model_args, device, t_to_sigma=t_to_sigma, no_parallel=True, old=args.old_score_model)
-#        args.ckpt = 'last_model.pt'
         state_dict = torch.load(f'{args.model_dir}/{args.ckpt}', map_location=torch.device('cpu'))
-        # if "model" not in state_dict.keys():
-        #     fixed_state_dict = {}
-        #     for key in state_dict.keys():
-        #         fixed_state_dict[key.replace('module.', '')] = state_dict[key]
-        #     state_dict = fixed_state_dict
-        if args.ckpt == 'last_model.pt':
+        if 'ema' in args.ckpt:
             model_state_dict = state_dict['model']
             ema_weights_state = state_dict['ema_weights']
-            fixed_state_dict = {}
-            for key in model_state_dict.keys():
-                fixed_state_dict[key.replace('module.', '')] = model_state_dict[key]
-            model_state_dict = fixed_state_dict
+            model_state_dict = state_dict_fixup(model_state_dict)
             model.load_state_dict(model_state_dict, strict=True)
             ema_weights = ExponentialMovingAverage(model.parameters(), decay=score_model_args.ema_rate)
             ema_weights.load_state_dict(ema_weights_state, device=device)
             ema_weights.copy_to(model.parameters())
         else:
-            if "model" in state_dict.keys():
-                # for key in ["optimizer", "ema_weights", "epoch"]:
-                #     if key in state_dict.keys():
-                #         del state_dict[key]
-                try:
-                    model.module.load_state_dict(state_dict["model"], strict=True)
-                except:
-                    fixed_state_dict = {}
-                    for key in state_dict["model"].keys():
-                        fixed_state_dict[key.replace('module.', '')] = state_dict["model"][key]
-                    state_dict["model"] = fixed_state_dict
-                    model.load_state_dict(state_dict["model"], strict=True)
-            else:
-                try:
-                    model.module.load_state_dict(state_dict, strict=True)
-                except:
-                    fixed_state_dict = {}
-                    for key in state_dict.keys():
-                        fixed_state_dict[key.replace('module.', '')] = state_dict[key]
-                    state_dict = fixed_state_dict
-                    model.load_state_dict(state_dict, strict=True)
+            state_dict = state_dict_fixup(state_dic)
+            model.load_state_dict(state_dict, strict=True)
         model = model.to(device)
         model.eval()
         if args.confidence_model_dir is not None:
@@ -406,7 +386,7 @@ if __name__ == '__main__':
     skipped = 0
 
     combined_datasets = CombineLazyPDBBindSet(test_dataset, confidence_test_dataset)
-    loader = DataLoader(combined_datasets, batch_size=1, num_workers=1, collate_fn=lambda batch: [x for x in batch if x is not None])
+    loader = DataLoader(combined_datasets, batch_size=1, collate_fn=lambda batch: [x for x in batch if x is not None], num_workers=args.num_dataloader_workers, prefetch_factor=args.dataloader_prefetch_factor)
 
     for batch in tqdm(loader):
         if not batch:
@@ -433,8 +413,6 @@ if __name__ == '__main__':
                                    args.pocket_knowledge, args.pocket_cutoff,
                                    initial_noise_std_proportion=args.initial_noise_std_proportion,
                                    choose_residue=args.choose_residue)
-                # print(torch.mean(data_list[0]['ligand'].pos, dim=0, keepdim=True))
-                # print(torch.mean(data_list[0]['receptor'].pos, dim=0, keepdim=True))
 
                 pdb = None
                 if args.save_visualisation:

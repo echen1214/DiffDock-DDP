@@ -25,7 +25,7 @@ from utils import so3, torus
 class NoiseTransform(BaseTransform):
     def __init__(self, t_to_sigma, no_torsion, all_atom, alpha=1, beta=1,
                  include_miscellaneous_atoms=False, crop_beyond_cutoff=None, time_independent=False, rmsd_cutoff=0,
-                 minimum_t=0, sampling_mixing_coeff=0, no_kabsch=False):
+                 minimum_t=0, sampling_mixing_coeff=0):
         self.t_to_sigma = t_to_sigma
         self.no_torsion = no_torsion
         self.all_atom = all_atom
@@ -37,7 +37,6 @@ class NoiseTransform(BaseTransform):
         self.crop_beyond_cutoff = crop_beyond_cutoff
         self.rmsd_cutoff = rmsd_cutoff
         self.time_independent = time_independent
-        self.no_kabsch=False
 
     def __call__(self, data):
         if data is None:
@@ -84,7 +83,7 @@ class NoiseTransform(BaseTransform):
         torsion_updates = np.random.normal(loc=0.0, scale=tor_sigma, size=data['ligand'].edge_mask.sum()) if torsion_updates is None else torsion_updates
         torsion_updates = None if self.no_torsion else torsion_updates
         try:
-            modify_conformer(data, tr_update, torch.from_numpy(rot_update).float(), torsion_updates, no_kabsch=self.no_kabsch)
+            modify_conformer(data, tr_update, torch.from_numpy(rot_update).float(), torsion_updates)
         except Exception as e:
             print("failed modify conformer")
             print(e)
@@ -206,16 +205,6 @@ class PDBBind(Dataset):
                 delattr(complex_graph['receptor'], a)
 
         return complex_graph
-
-    def get_all_complexes(self):
-        ret = {}
-        for idx in range(0, self.len()):
-            try:
-                complex_graph = self.get(idx)
-                ret[complex_graph.name] = complex_graph
-            except:
-                print('Missing complex at idx ' + str(idx))
-        return ret
 
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
@@ -387,8 +376,7 @@ class PDBBind(Dataset):
             get_lig_graph_with_matching(lig, complex_graph, self.popsize, self.maxiter, self.matching, self.keep_original,
                                         self.num_conformers, remove_hs=self.remove_hs, tries=self.matching_tries)
 
-            short_name = name.split('_')[0]
-            moad_extract_receptor_structure(path=os.path.join(self.pdbbind_dir, name, f'{short_name}_{self.protein_file}.pdb'),
+            moad_extract_receptor_structure(path=os.path.join(self.pdbbind_dir, name, f'{name}_{self.protein_file}.pdb'),
                                             complex_graph=complex_graph,
                                             neighbor_cutoff=self.receptor_radius,
                                             max_neighbors=self.c_alpha_max_neighbors,
@@ -467,8 +455,7 @@ def print_statistics(complex_graphs):
 
 
 def read_mol(pdbbind_dir, name, suffix='ligand', remove_hs=False):
-    short_name = name.split('_')[0]
-    lig = read_molecule(os.path.join(pdbbind_dir, name, f'{short_name}_{suffix}.sdf'), remove_hs=remove_hs, sanitize=True)
+    lig = read_molecule(os.path.join(pdbbind_dir, name, f'{name}_{suffix}.sdf'), remove_hs=remove_hs, sanitize=True)
     if lig is None:  # read mol2 file if sdf file cannot be sanitized
         lig = read_molecule(os.path.join(pdbbind_dir, name, f'{name}_{suffix}.mol2'), remove_hs=remove_hs, sanitize=True)
     return lig

@@ -50,7 +50,7 @@ def construct_loader(args, t_to_sigma, device):
     transform = NoiseTransform(t_to_sigma=t_to_sigma, no_torsion=args.no_torsion,
                                all_atom=args.all_atoms, alpha=args.sampling_alpha, beta=args.sampling_beta,
                                include_miscellaneous_atoms=False if not hasattr(args, 'include_miscellaneous_atoms') else args.include_miscellaneous_atoms,
-                               crop_beyond_cutoff=args.crop_beyond, no_kabsch=args.no_kabsch)
+                               crop_beyond_cutoff=args.crop_beyond)
     if args.triple_training: assert args.combined_training
 
     sequences_to_embeddings = None

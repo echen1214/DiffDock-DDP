@@ -117,7 +117,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                                                                optimizer=optimizer)
 
         logs = {}
-        train_losses = train_epoch(model, train_loader, optimizer, args.device, t_to_sigma, loss_fn, ema_weights if epoch > freeze_params else None, weighted_tor=args.weighted_tor)
+        train_losses = train_epoch(model, train_loader, optimizer, args.device, t_to_sigma, loss_fn, ema_weights if epoch > freeze_params else None)
         # number of tdqm batches = len(train_dataset) / (args.batch_size)
         
         print("Epoch {}: Training loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   sc {:.4f}  lr {:.4f}"
@@ -127,11 +127,11 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
         if epoch > freeze_params:
             ema_weights.store(model.parameters())
             if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
-        val_losses = test_epoch(model, val_loader, args.device, t_to_sigma, loss_fn, args.test_sigma_intervals, args.weighted_tor)
+        val_losses = test_epoch(model, val_loader, args.device, t_to_sigma, loss_fn, args.test_sigma_intervals)
         print("Epoch {}: Validation loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   sc {:.4f}"
               .format(epoch, val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['sidechain_loss']))
 
-        if args.train_inference_freq != None and (epoch + 1) % args.train_inference_freq == 0:
+        if args.train_inference_freq != None and epoch % args.train_inference_freq == 0:
             inf_metrics = inference_epoch_fix(model, train_loader, args.device, t_to_sigma, args)
             print("Epoch {}: Train inference rmsd_median {:.3f} rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f} centroid_median {:.3f} centroid_lt2 {:.3f} centroid_lt5 {:.3f} min_centroid_lt2 {:.3f} min_centroid_lt5 {:.3f}"
                   .format(epoch, inf_metrics['rmsd_median'], inf_metrics['rmsds_lt2'], inf_metrics['rmsds_lt5'], inf_metrics['min_rmsds_lt2'], inf_metrics['min_rmsds_lt5'], inf_metrics['centroid_median'], inf_metrics['centroid_lt2'], inf_metrics['centroid_lt5'], inf_metrics['min_centroid_lt2'], inf_metrics['min_centroid_lt5']))
@@ -240,11 +240,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
         if scheduler:
             if epoch < freeze_params or (args.scheduler == 'linear_warmup' and epoch < args.warmup_dur):
                 scheduler.step()
-            #elif args.val_inference_freq is not None:
-            #    scheduler.step(best_val_inference_value)
+            elif args.val_inference_freq is not None:
+                scheduler.step(best_val_inference_value)
             else:
-                scheduler.step(train_losses['loss'])
-                #scheduler.step(val_losses['loss'])
+                scheduler.step(val_losses['loss'])
 
         if not args.DDP or args.rank == 0:
             torch.save({
@@ -272,8 +271,8 @@ def main_function():
                 arg_dict[key] = value
         args.config = args.config.name
     assert (args.inference_earlystop_goal == 'max' or args.inference_earlystop_goal == 'min')
-#    if args.val_inference_freq is not None and args.scheduler is not None:
-#        assert (args.scheduler_patience > args.val_inference_freq) # otherwise we will just stop training after args.scheduler_patience epochs
+    if args.val_inference_freq is not None and args.scheduler is not None:
+        assert (args.scheduler_patience > args.val_inference_freq) # otherwise we will just stop training after args.scheduler_patience epochs
     if args.cudnn_benchmark:
         torch.backends.cudnn.benchmark = True
 
@@ -302,7 +301,7 @@ def main_function():
     else:
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    if args.wandb:
+    if args.wandb and args.entity:
         wandb_args = {
             'entity':args.entity,
             'settings':wandb.Settings(start_method="fork"),
@@ -364,7 +363,7 @@ def main_function():
         pdbbind_loader = None
 
     model = get_model(args, device, t_to_sigma=t_to_sigma, no_parallel=args.no_parallel)
-    optimizer, scheduler = get_optimizer_and_scheduler(args, model, scheduler_mode='min') #args.inference_earlystop_goal if args.val_inference_freq is not None else 'min')
+    optimizer, scheduler = get_optimizer_and_scheduler(args, model, scheduler_mode=args.inference_earlystop_goal if args.val_inference_freq is not None else 'min')
     ema_weights = ExponentialMovingAverage(model.parameters(),decay=args.ema_rate)
 
     if args.restart_dir:
@@ -409,21 +408,10 @@ def main_function():
                 model.module.load_state_dict(chkpt, strict=True)
             except:
                 model.load_state_dict(chkpt, strict=True)
-        # try:
-        #     model.module.load_state_dict(chkpt, strict=True)
-        # except:
-        #     model.load_state_dict(chkpt, strict=True)
         print("Using pretrained model", f'{args.pretrain_dir}/{args.pretrain_ckpt}.pt')
 
     numel = sum([p.numel() for p in model.parameters()])
     print('Model with', numel, 'parameters')
-
-    # if args.wandb:
-    #     if args.DDP:
-    #         if args.local_rank==0:
-    #             wandb.log({'numel': numel})
-    #     else:
-    #         wandb.log({'numel': numel})
 
     run_dir = os.path.join(args.log_dir, args.run_name)
     args.device = device
@@ -431,7 +419,14 @@ def main_function():
     # record parameters
     if not args.DDP or rank == 0:
         yaml_file_name = os.path.join(run_dir, 'model_parameters.yml')
-        save_yaml_file(yaml_file_name, args.__dict__) 
+        model_args = copy.deepcopy(args.__dict__)
+        if 'DDP' in model_args:
+            del model_args['DDP']
+        if 'device' in model_args:
+            del model_args['device']
+        if 'n_epochs_range' in model_args:
+            del model_args['n_epochs_range']
+        save_yaml_file(yaml_file_name, model_args) 
 
     if args.cpu_profile:
         profiler = cProfile.Profile(time.process_time)
@@ -439,10 +434,6 @@ def main_function():
         train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, pdbbind_loader)
         profiler.disable()
         profiler.print_stats(sort='tottime')
-        #s = io.StringIO()
-        #stats = pstats.Stats(profiler, stream=s)
-        #stats.sort_stats('tottime')
-        #stats.print_stats()
     else:
         train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, pdbbind_loader)
 
