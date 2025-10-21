@@ -278,12 +278,13 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                                            (hasattr(args, 'backbone_loss_weight') and args.backbone_loss_weight > 0),
                             depthwise_convolution=args.depthwise_convolution if hasattr(args, 'depthwise_convolution') else False)
 
-    if args.DDP:
+    if hasattr(args, 'DDP'):
+        if args.DDP:
         ## when this flag is on, local_rank gets stored as device 
-        print(f"Training with DistributedDataParallel on rank {torch.distributed.get_rank()} ({device})")
-        model = model.to(device)
-        ddp = DistributedDataParallel(model, device_ids=[device],  find_unused_parameters=True)
-        return ddp
+            print(f"Training with DistributedDataParallel on rank {torch.distributed.get_rank()} ({device})")
+            model = model.to(device)
+            ddp = DistributedDataParallel(model, device_ids=[device],  find_unused_parameters=True)
+            return ddp
     else:
         if device.type == 'cuda' and not no_parallel and ('dataset' not in args or not args.dataset == 'torsional'):
             print("Training with DataParallel")

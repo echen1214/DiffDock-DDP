@@ -161,6 +161,8 @@ if __name__ == '__main__':
     parser.add_argument('--crop_beyond', type=float, default=None, help='')
 
     args = parser.parse_args()
+
+    # this uses the config file to overwrite parser arguments
     if args.config:
         config_dict = yaml.load(args.config, Loader=yaml.FullLoader)
         arg_dict = args.__dict__
@@ -169,7 +171,11 @@ if __name__ == '__main__':
                 for v in value:
                     arg_dict[key].append(v)
             else:
-                arg_dict[key] = value
+                if key in arg_dict:
+                    if arg_dict[key] != value:
+                        print(f"Warning: Conflict for argument '{key}': command-line value '{arg_dict[key]}' is being overwritten by config value '{value}'")
+                    arg_dict[key] = value
+        
 
     if args.restrict_cpu:
         threads = 16
@@ -229,8 +235,8 @@ if __name__ == '__main__':
             score_model_args.esm_embeddings_path = None
         if args.force_fixed_center_conv:
             score_model_args.not_fixed_center_conv = False
-        if not hasattr(score_model_args, 'DDP'):
-            score_model_args.DDP = False
+        # if not hasattr(score_model_args, 'DDP'):
+        score_model_args.DDP = False
         if hasattr(args, 'cache_path'):
             score_model_args.cache_path = args.cache_path
     if args.confidence_model_dir is not None:
@@ -246,8 +252,8 @@ if __name__ == '__main__':
             confidence_args.esm_embeddings_path = None
         if not hasattr(confidence_args, 'num_classification_bins'):
             confidence_args.num_classification_bins = 2
-        if not hasattr(confidence_args, 'DDP'):
-            confidence_args.DDP = False
+        # if not hasattr(confidence_args, 'DDP'):
+        confidence_args.DDP = False
         if hasattr(args, 'confidence_cache_path'):
             confidence_args.cache_path = args.confidence_cache_path
 
@@ -270,10 +276,11 @@ if __name__ == '__main__':
         model = get_model(score_model_args, device, t_to_sigma=t_to_sigma, no_parallel=True, old=args.old_score_model)
 #        args.ckpt = 'last_model.pt'
         state_dict = torch.load(f'{args.model_dir}/{args.ckpt}', map_location=torch.device('cpu'))
-        fixed_state_dict = {}
-        for key in state_dict.keys():
-            fixed_state_dict[key.replace('module.', '')] = state_dict[key]
-        state_dict = fixed_state_dict
+        # if "model" not in state_dict.keys():
+        #     fixed_state_dict = {}
+        #     for key in state_dict.keys():
+        #         fixed_state_dict[key.replace('module.', '')] = state_dict[key]
+        #     state_dict = fixed_state_dict
         if args.ckpt == 'last_model.pt':
             model_state_dict = state_dict['model']
             ema_weights_state = state_dict['ema_weights']
@@ -286,9 +293,29 @@ if __name__ == '__main__':
             ema_weights.load_state_dict(ema_weights_state, device=device)
             ema_weights.copy_to(model.parameters())
         else:
-            model.load_state_dict(state_dict, strict=True)
-            model = model.to(device)
-            model.eval()
+            if "model" in state_dict.keys():
+                # for key in ["optimizer", "ema_weights", "epoch"]:
+                #     if key in state_dict.keys():
+                #         del state_dict[key]
+                try:
+                    model.module.load_state_dict(state_dict["model"], strict=True)
+                except:
+                    fixed_state_dict = {}
+                    for key in state_dict["model"].keys():
+                        fixed_state_dict[key.replace('module.', '')] = state_dict["model"][key]
+                    state_dict["model"] = fixed_state_dict
+                    model.load_state_dict(state_dict["model"], strict=True)
+            else:
+                try:
+                    model.module.load_state_dict(state_dict, strict=True)
+                except:
+                    fixed_state_dict = {}
+                    for key in state_dict.keys():
+                        fixed_state_dict[key.replace('module.', '')] = state_dict[key]
+                    state_dict = fixed_state_dict
+                    model.load_state_dict(state_dict, strict=True)
+        model = model.to(device)
+        model.eval()
         if args.confidence_model_dir is not None:
             if confidence_args.transfer_weights:
                 with open(f'{confidence_args.original_model_dir}/model_parameters.yml') as f:
@@ -415,6 +442,7 @@ if __name__ == '__main__':
                     for idx, graph in enumerate(data_list):
                         lig = orig_complex_graph.mol[0]
                         pdb = PDBFile(lig)
+                        # what is this code doing here? why is pdb.add running 3 times? what do the order/part functions do/mean?
                         pdb.add(lig, 0, 0)
                         pdb.add(((orig_complex_graph['ligand'].pos if not args.resample_rdkit else orig_complex_graph['ligand'].pos[idx]) + orig_complex_graph.original_center).detach().cpu(), 1, 0)
                         pdb.add((graph['ligand'].pos + graph.original_center).detach().cpu(), part=1, order=1)

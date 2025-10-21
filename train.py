@@ -194,7 +194,11 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
         if args.inference_earlystop_avg_infsteps > 0 and args.inference_earlystop_metric in logs.keys():
             if args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
                 running_val_inference_metric.append(logs[args.inference_earlystop_metric])
-            print("logs", running_val_inference_metric)
+            # print("logs", running_val_inference_metric)
+                print("logs", 
+                    f"mean {mean(running_val_inference_metric[-args.inference_earlystop_avg_infsteps:],axis=0)}",
+                    [f"{met:3f}" for met in running_val_inference_metric[-args.inference_earlystop_avg_infsteps:]])
+
             if (args.inference_earlystop_goal == 'min' and mean(running_val_inference_metric[-args.inference_earlystop_avg_infsteps:],axis=0) <= running_best_val_inference_value or
                     args.inference_earlystop_goal == 'max' and mean(running_val_inference_metric[-args.inference_earlystop_avg_infsteps:],axis=0) >= running_best_val_inference_value) and (not args.DDP or args.rank == 0):
                 running_best_val_inference_value = mean(running_val_inference_metric[-args.inference_earlystop_avg_infsteps:],axis=0)
