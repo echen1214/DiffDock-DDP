@@ -145,9 +145,11 @@ def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
     with open(f'{args.model_dir}/model_parameters.yml') as f:
         score_model_args = Namespace(**yaml.full_load(f))
+        score_model_args.DDP=False
     if args.confidence_model_dir is not None:
         with open(f'{args.confidence_model_dir}/model_parameters.yml') as f:
             confidence_args = Namespace(**yaml.full_load(f))
+            confidence_args.DDP=False
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"DiffDock will run on {device}")
